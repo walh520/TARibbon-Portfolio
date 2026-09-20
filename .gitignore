@@ -1,0 +1,15 @@
+Binaries/
+Intermediate/
+DerivedDataCache/
+Saved/
+.vs/
+*.sln
+*.suo
+*.user
+*.pdb
+*.dll
+*.exe
+*.uasset
+*.umap
+*.tmp
+*.log

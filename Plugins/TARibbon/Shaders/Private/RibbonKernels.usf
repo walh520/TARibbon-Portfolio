@@ -1,0 +1,224 @@
+#include "/Engine/Public/Platform.ush"
+#include "RibbonCommon.ush"
+
+// Persistent vertex state, all float4. State0=(position.xyz, inverseMass), State1=(velocity.xyz, asfloat(flags)).
+RWStructuredBuffer<float4> State0;
+RWStructuredBuffer<float4> State1;
+StructuredBuffer<float4> VertexRest;          // (restPosition.xyz, softPinInfluence)
+StructuredBuffer<float4> PinTarget;           // (current target.xyz, compliance m/N)
+StructuredBuffer<float4> PinPreviousTarget;   // (previous substep target.xyz, unused)
+RWStructuredBuffer<float4> ExternalImpulse;   // delta-v xyz, consumed by PredictVertices
+RWStructuredBuffer<float4> SubstepStartPos;   // saved x before prediction
+RWStructuredBuffer<float4> FreeVelocity;      // saved predicted v before constraint/contact corrections
+
+StructuredBuffer<uint4> TriIndices;
+StructuredBuffer<float4> TriRest0;
+StructuredBuffer<float4> TriRest1;
+StructuredBuffer<float4> TriRest2;
+StructuredBuffer<float4> TriRest3;
+StructuredBuffer<float4> TriRest4;
+StructuredBuffer<float4> TriArtCoord;
+StructuredBuffer<float4> FaceWind;            // host wind W.xyz; w is host wind magnitude clamp (0=no additional clamp)
+RWStructuredBuffer<float4> FaceAeroForce;     // total force on face, N
+StructuredBuffer<uint4> PackedVertexFaceOffsets; // scalar CSR offsets v and v+1
+StructuredBuffer<uint4> PackedVertexFaceRefs;    // scalar CSR triangle IDs
+StructuredBuffer<float4> ArtWave0;            // (world direction.xyz, amplitude m/s)
+StructuredBuffer<float4> ArtWave1;            // (frequency Hz, wavelength m, phase, enabled)
+StructuredBuffer<float4> ArtWave2;            // (materialDirection.xy, unused, unused)
+
+RWStructuredBuffer<float4> TriangleLambda;    // (lambdaU, lambdaV, lambdaS, unused)
+StructuredBuffer<uint4> PackedTriangleColorRefs;
+StructuredBuffer<uint4> TriangleColorRanges;  // one uint4 per color: (first scalar reference, count, unused, unused)
+
+StructuredBuffer<uint4> HingeIndices;
+StructuredBuffer<float4> HingeRest;           // (theta0,L0,dualWidth0,D)
+RWStructuredBuffer<float4> HingeLambda;       // (lambda, unused, unused, unused)
+StructuredBuffer<uint4> PackedHingeColorRefs;
+StructuredBuffer<uint4> HingeColorRanges;     // one uint4 per color: (first scalar reference,count,unused,unused)
+
+// Collider is five float4 records per collider: Meta=(asfloat(type), friction, unused, unused);
+// Geometry0: plane=(normal.xyz,d), sphere=(center.xyz,radius), capsule=(A.xyz,radius).
+// Geometry1: capsule B.xyz; otherwise surface angular-velocity reference point.
+// Motion0=(linear velocity.xyz,unused), Motion1=(angular velocity.xyz,unused).
+StructuredBuffer<float4> ColliderMeta;
+StructuredBuffer<float4> ColliderGeometry0;
+StructuredBuffer<float4> ColliderGeometry1;
+StructuredBuffer<float4> ColliderMotion0;
+StructuredBuffer<float4> ColliderMotion1;
+
+RWStructuredBuffer<float4> VertexNormal;      // deformed vertex normal xyz
+RWStructuredBuffer<float4> VertexTangent;     // deformed material-U tangent xyz
+StructuredBuffer<float4> VertexRestNormal;    // stable fallback normal xyz
+StructuredBuffer<uint4> RenderBinding;        // (sim i0, sim i1, sim i2, flags)
+StructuredBuffer<float4> RenderBaryOffset;    // (b0,b1,b2,rest normal offset meters)
+RWStructuredBuffer<float4> RenderPosition;    // current rendered position xyz
+RWStructuredBuffer<float4> RenderPreviousPosition; // prior render-frame position xyz
+RWStructuredBuffer<float4> RenderNormal;      // current smooth shading normal xyz
+RWStructuredBuffer<float4> RenderTangent;     // current material-U shading tangent xyz
+RWStructuredBuffer<uint4> Diagnostics;        // [0]=(badTriangle,badHinge,windClamped,badContact), 16B element
+// Every function below remains a distinct UE Global Shader entry point so the host preserves plan ordering.
+
+[numthreads(1,1,1)] void ClearDiagnostics(uint3 tid:SV_DispatchThreadID) { Diagnostics[0]=0; }
+
+void DiagAdd(uint lane)
+{
+    if(lane==0u) InterlockedAdd(Diagnostics[0].x,1u); else if(lane==1u) InterlockedAdd(Diagnostics[0].y,1u);
+    else if(lane==2u) InterlockedAdd(Diagnostics[0].z,1u); else InterlockedAdd(Diagnostics[0].w,1u);
+}
+float3 ArtWind(uint tri)
+{
+    if (ArtWindParams.x <= 0.0f || (asuint(TriIndices[tri].w)&TR_FLAG_ART_WIND)==0u) return 0;
+    float4 uv=TriArtCoord[tri]; float3 ans=0; uint n=min((uint)ArtWindParams.y,4u);
+    [loop] for(uint j=0;j<n;++j)
+    {
+        float4 w0=ArtWave0[j],w1=ArtWave1[j];
+        if(w1.w<=0.0f || w1.y<=TR_EPS) continue;
+        float2 md=ArtWave2[j].xy; float md2=dot(md,md); md=(md2>NORMALIZE2_FLOOR) ? md*rsqrt(md2) : float2(1,0);
+        float phase=TWO_PI*(dot(md,uv.xy)/w1.y-w1.x*GravityAndTime.w) + w1.z + ArtWindParams.w*uv.z;
+        float3 velocityDirection=SafeNormalize(w0.xyz,float3(0,0,1));
+        ans += velocityDirection * (w0.w*ArtWindParams.z*uv.w*sin(phase));
+    }
+    return ans;
+}
+
+// Pass A: reads persistent state only. One invocation writes one face force, preventing predict read/write hazards.
+[numthreads(128,1,1)] void ComputeFaceAeroForces(uint3 tid:SV_DispatchThreadID)
+{
+    uint t=tid.x; if(t>=RTriangleCount()) return;
+    uint4 ix=TriIndices[t]; if((ix.w&TR_FLAG_VALID)==0u){FaceAeroForce[t]=float4(0,0,0,0);return;}
+    float3 x0=State0[ix.x].xyz,x1=State0[ix.y].xyz,x2=State0[ix.z].xyz;
+    float3 nRaw=cross(x1-x0,x2-x0); float area2=length(nRaw);
+    if(TriangleCollapsed(x0,x1,x2,TriRest0[t].w)){FaceAeroForce[t]=float4(0,0,0,0);DiagAdd(0);return;}
+    float3 n=nRaw/area2; float area=0.5f*area2;
+    float3 v=(State1[ix.x].xyz+State1[ix.y].xyz+State1[ix.z].xyz)/3.0f;
+    float3 W=FaceWind[t].xyz+ArtWind(t); float hostClamp=FaceWind[t].w;
+    float clamp=(Params1.y>0.0f) ? Params1.y : 3.402823466e+38f;
+    if(hostClamp>0.0f) clamp=min(clamp,hostClamp);
+    float wlen=length(W); if(wlen>clamp){W*=clamp/wlen;DiagAdd(2);}
+    float3 u=W-v; float un=dot(u,n); float3 ut=u-un*n; float4 r3=TriRest3[t],r4=TriRest4[t];
+    float response=saturate(r4.x)*(1.0f-saturate(r4.y));
+    float3 fn=0.5f*Params1.x*r3.z*area*un*abs(un)*n;
+    float3 ft=0.5f*Params1.x*r3.w*area*length(ut)*ut;
+    FaceAeroForce[t]=float4((fn+ft)*response,0);
+}
+
+// Pass B: per-vertex gather of immutable face forces, save old state, then semi-implicit prediction.
+[numthreads(128,1,1)] void PredictVertices(uint3 tid:SV_DispatchThreadID)
+{
+    uint i=tid.x; if(i>=RVertexCount())return; float4 s=State0[i],sv=State1[i]; uint flags=asuint(sv.w);
+    float3 oldX=s.xyz; SubstepStartPos[i]=float4(oldX,0);
+    if((flags&VTX_FLAG_HARD_PIN)!=0u){float3 q=PinTarget[i].xyz; float3 v=(q-PinPreviousTarget[i].xyz)*Params0.y; State0[i]=float4(q,0);State1[i]=float4(v,asfloat(flags));FreeVelocity[i]=float4(v,0);ExternalImpulse[i]=float4(0,0,0,0);return;}
+    float3 force=0; uint first=PackedUint(PackedVertexFaceOffsets,i), end=PackedUint(PackedVertexFaceOffsets,i+1u);
+    [loop]for(uint k=first;k<end;++k)force+=FaceAeroForce[PackedUint(PackedVertexFaceRefs,k)]*(1.0f/3.0f);
+    float3 aeroAcceleration=force*s.w;
+    if(Params2.w>0.0f){float al=length(aeroAcceleration);if(al>Params2.w){aeroAcceleration*=Params2.w/al;DiagAdd(2);}}
+    float3 a=GravityAndTime.xyz*Params0.w + aeroAcceleration;
+    float3 v=(sv.xyz+Params0.x*a+ExternalImpulse[i].xyz)*exp(-Params0.z*Params0.x);
+    if(Params2.z>0){float vl=length(v);if(vl>Params2.z)v*=Params2.z/vl;}
+    State0[i]=float4(oldX+Params0.x*v,s.w);State1[i]=float4(v,asfloat(flags));FreeVelocity[i]=float4(v,0);ExternalImpulse[i]=float4(0,0,0,0);
+}
+
+void ProjectScalar(inout float3 x0,inout float3 x1,inout float3 x2,float w0,float w1,float w2,float C,float3 g0,float3 g1,float3 g2,float alphaTilde,inout float lambda)
+{
+    float denom=w0*dot(g0,g0)+w1*dot(g1,g1)+w2*dot(g2,g2)+alphaTilde;
+    if(denom<=TR_EPS)return; float dl=(-C-alphaTilde*lambda)/denom; lambda+=dl; x0+=w0*g0*dl;x1+=w1*g1*dl;x2+=w2*g2*dl;
+}
+// A color range contains triangles with no shared vertices. Host dispatches exactly one color at a time.
+[numthreads(64,1,1)] void SolveTriangleColor(uint3 tid:SV_DispatchThreadID)
+{
+    uint color=RActiveColor(); uint local=tid.x; uint4 range=TriangleColorRanges[color]; if(local>=range.y)return;
+    uint t=PackedUint(PackedTriangleColorRefs,range.x+local); uint4 ix=TriIndices[t]; if((ix.w&TR_FLAG_VALID)==0u)return;
+    float4 a=State0[ix.x],b=State0[ix.y],c=State0[ix.z],r0=TriRest0[t],r1=TriRest1[t],r2=TriRest2[t],r3=TriRest3[t];
+    if(r0.w<=0.0f){DiagAdd(0);return;} float3 x0=a.xyz,x1=b.xyz,x2=c.xyz; if(TriangleCollapsed(x0,x1,x2,r0.w)){DiagAdd(0);return;} float3 au,av;TriangleGradientCoefficients(r1,r2,au,av);float4 lam=TriangleLambda[t];float at;
+    // U strain
+    float3 fu=TriangleFu(x0,x1,x2,r1,r2);float lu=length(fu);if(r2.w>0 && lu>TR_EPS){float3 gu=fu/lu;at=1.0f/(r0.w*r2.w)/(Params0.x*Params0.x);ProjectScalar(x0,x1,x2,a.w,b.w,c.w,lu-1.0f,au.x*gu,au.y*gu,au.z*gu,at,lam.x);}
+    // V strain is re-evaluated after U
+    float3 fv=TriangleFv(x0,x1,x2,r1,r2);float lv=length(fv);if(r3.x>0 && lv>TR_EPS){float3 gv=fv/lv;at=1.0f/(r0.w*r3.x)/(Params0.x*Params0.x);ProjectScalar(x0,x1,x2,a.w,b.w,c.w,lv-1.0f,av.x*gv,av.y*gv,av.z*gv,at,lam.y);}
+    // shear is re-evaluated after V
+    fu=TriangleFu(x0,x1,x2,r1,r2);fv=TriangleFv(x0,x1,x2,r1,r2);if(r3.y>0){at=1.0f/(r0.w*r3.y)/(Params0.x*Params0.x);ProjectScalar(x0,x1,x2,a.w,b.w,c.w,dot(fu,fv),au.x*fv+av.x*fu,au.y*fv+av.y*fu,au.z*fv+av.z*fu,at,lam.z);}
+    State0[ix.x]=float4(x0,a.w);State0[ix.y]=float4(x1,b.w);State0[ix.z]=float4(x2,c.w);TriangleLambda[t]=lam;
+}
+
+RWStructuredBuffer<float4> SoftPinLambda;     // one element per vertex, lambda in x
+[numthreads(128,1,1)] void ResetTriangleLambdas(uint3 tid:SV_DispatchThreadID)
+{ uint i=tid.x;if(i<RTriangleCount())TriangleLambda[i]=float4(0,0,0,0); }
+[numthreads(128,1,1)] void ResetHingeLambdas(uint3 tid:SV_DispatchThreadID)
+{ uint i=tid.x;if(i<RHingeCount())HingeLambda[i]=float4(0,0,0,0); }
+[numthreads(128,1,1)] void ResetSoftPinLambdas(uint3 tid:SV_DispatchThreadID)
+{ uint i=tid.x;if(i<RVertexCount())SoftPinLambda[i]=float4(0,0,0,0); }
+
+// Soft pins run per vertex and are race free. invMass=0 hard pins are deliberately skipped.
+[numthreads(128,1,1)] void SolveSoftPins(uint3 tid:SV_DispatchThreadID)
+{
+    uint i=tid.x;if(i>=RVertexCount())return;float4 s=State0[i],p=PinTarget[i];float influence=saturate(VertexRest[i].w);
+    if(influence<=0 || Params2.x<=0.0f || p.w<=0 || s.w<=0)return;
+    float3 d=s.xyz-p.xyz;float l=length(d);if(l<=TR_EPS)return;
+    float alphaTilde=(p.w/max(influence*Params2.x,TR_EPS))/(Params0.x*Params0.x);float lambda=SoftPinLambda[i].x;
+    float dl=(-l-alphaTilde*lambda)/(s.w+alphaTilde);lambda+=dl;s.xyz+=s.w*(d/l)*dl;State0[i]=s;SoftPinLambda[i]=float4(lambda,0,0,0);
+}
+
+void ProjectHinge(inout float3 p0,inout float3 p1,inout float3 p2,inout float3 p3,float w0,float w1,float w2,float w3,float C,float3 g0,float3 g1,float3 g2,float3 g3,float alphaTilde,inout float lambda)
+{
+    float denom=w0*dot(g0,g0)+w1*dot(g1,g1)+w2*dot(g2,g2)+w3*dot(g3,g3)+alphaTilde;if(denom<=TR_EPS)return;
+    float dl=(-C-alphaTilde*lambda)/denom;lambda+=dl;p0+=w0*g0*dl;p1+=w1*g1*dl;p2+=w2*g2*dl;p3+=w3*g3*dl;
+}
+// Hinge colors have no common vertices. Analytic signs are validated by central differences in CPU/offline tests.
+[numthreads(64,1,1)] void SolveHingeColor(uint3 tid:SV_DispatchThreadID)
+{
+    uint color=RActiveColor(),local=tid.x;uint4 range=HingeColorRanges[color];if(local>=range.y)return;uint h=PackedUint(PackedHingeColorRefs,range.x+local);uint4 ix=HingeIndices[h];float4 a=State0[ix.x],b=State0[ix.y],c=State0[ix.z],d=State0[ix.w],r=HingeRest[h];
+    if(r.y<=0.0f || r.z<=0.0f || r.w<=0.0f)return;bool valid;float3 g0,g1,g2,g3;DihedralAnalyticGradients(a.xyz,b.xyz,c.xyz,d.xyz,r.y,g0,g1,g2,g3,valid);
+    if(!valid){DiagAdd(1);return;}float3 edge=b.xyz-a.xyz,n0=cross(edge,c.xyz-a.xyz),n1=cross(d.xyz-a.xyz,edge);float C=WrapPi(atan2(dot(edge*rsqrt(dot(edge,edge)),cross(n0*rsqrt(dot(n0,n0)),n1*rsqrt(dot(n1,n1)))),dot(n0*rsqrt(dot(n0,n0)),n1*rsqrt(dot(n1,n1))))-r.x);float alpha=1.0f/(r.w*r.y/r.z);float at=alpha/(Params0.x*Params0.x);float lambda=HingeLambda[h].x;ProjectHinge(a.xyz,b.xyz,c.xyz,d.xyz,a.w,b.w,c.w,d.w,C,g0,g1,g2,g3,at,lambda);
+    State0[ix.x]=a;State0[ix.y]=b;State0[ix.z]=c;State0[ix.w]=d;HingeLambda[h]=float4(lambda,0,0,0);
+}
+
+float3 SurfaceVelocity(uint c,uint type,float3 worldPoint)
+{
+    float3 pivot=(type==CONTACT_CAPSULE) ? 0.5f*(ColliderGeometry0[c].xyz+ColliderGeometry1[c].xyz) : ((type==CONTACT_SPHERE) ? ColliderGeometry0[c].xyz : ColliderGeometry1[c].xyz);
+    return ColliderMotion0[c].xyz+cross(ColliderMotion1[c].xyz,worldPoint-pivot);
+}
+void ContactGeometry(uint c,float3 x,out float3 n,out float phi,out bool valid)
+{
+    uint type=asuint(ColliderMeta[c].x);n=0;phi=1;valid=true;
+    if(type==CONTACT_PLANE){float4 g=ColliderGeometry0[c];n=SafeNormalize(g.xyz,float3(0,0,1));phi=dot(x,n)-g.w;}
+    else if(type==CONTACT_SPHERE){float4 g=ColliderGeometry0[c];float3 q=x-g.xyz;float l=length(q);n=SafeNormalize(q,float3(0,0,1));phi=l-g.w;}
+    else if(type==CONTACT_CAPSULE){float4 g=ColliderGeometry0[c];float3 A=g.xyz,B=ColliderGeometry1[c].xyz,ab=B-A;float ab2=dot(ab,ab);float u=(ab2>1.0e-24f)?saturate(dot(x-A,ab)/ab2):0.0f;float3 q=x-(A+u*ab);float l=length(q);n=SafeNormalize(q,AnyPerpendicular(SafeNormalize(ab,float3(0,0,1))));phi=l-g.w;}
+    else valid=false;
+}
+// Run after each solver iteration. This pass changes only positions; it must be followed by a UAV barrier.
+[numthreads(128,1,1)] void ProjectContacts(uint3 tid:SV_DispatchThreadID)
+{
+    uint i=tid.x;if(i>=RVertexCount())return;float4 s=State0[i];if(s.w<=0)return;float3 x=s.xyz;
+    [loop]for(uint c=0;c<RColliderCount();++c){float3 n;float phi;bool valid;ContactGeometry(c,x,n,phi,valid);if(!valid){DiagAdd(3);continue;}float support=max(Params1.z-phi,0.0f);if(support>0.0f)x+=support*n;}
+    State0[i]=float4(x,s.w);
+}
+// After every positional projection is complete, reconstruct solver velocity and apply contact velocity response.
+// FreeVelocity contributes only the normal impulse bound; it is never substituted for the solved velocity.
+[numthreads(128,1,1)] void UpdateVelocitiesAndApplyContactFriction(uint3 tid:SV_DispatchThreadID)
+{
+    uint i=tid.x;if(i>=RVertexCount())return;float4 s=State0[i],sv=State1[i];if(s.w<=0)return;float3 x=s.xyz,v=(x-SubstepStartPos[i].xyz)*Params0.y;
+    [loop]for(uint c=0;c<RColliderCount();++c)
+    {
+        float3 n;float phi;bool valid;ContactGeometry(c,x,n,phi,valid);if(!valid){DiagAdd(3);continue;}
+        if(phi>Params1.z+Params1.w)continue;uint type=asuint(ColliderMeta[c].x);float3 vs=SurfaceVelocity(c,type,x);float vn=dot(v-vs,n);
+        float normalDV=max(max(-dot(FreeVelocity[i].xyz-vs,n),-vn),0.0f);if(vn<0.0f)v-=vn*n;
+        // Both free and reconstructed normal velocities contribute to the bound.
+        // No persistent normal multiplier is stored, so this is a friction approximation.
+        float3 tang=(v-vs)-dot(v-vs,n)*n;float tl=length(tang);float maxTang=max(ColliderMeta[c].y,0.0f)*normalDV;if(tl>TR_EPS)v-=tang*min(1.0f,maxTang/tl);
+    }
+    State1[i]=float4(v,sv.w);
+}
+
+// Gathering face contributions avoids atomics. Tangent comes from current material-U and is projected onto normal.
+[numthreads(128,1,1)] void GatherVertexFrames(uint3 tid:SV_DispatchThreadID)
+{
+    uint i=tid.x;if(i>=RVertexCount())return;uint first=PackedUint(PackedVertexFaceOffsets,i),end=PackedUint(PackedVertexFaceOffsets,i+1u);float3 nsum=0,tsum=0;
+    [loop]for(uint k=first;k<end;++k){uint t=PackedUint(PackedVertexFaceRefs,k);uint4 ix=TriIndices[t];float3 x0=State0[ix.x].xyz,x1=State0[ix.y].xyz,x2=State0[ix.z].xyz;if(TriangleCollapsed(x0,x1,x2,TriRest0[t].w))continue;float3 cr=cross(x1-x0,x2-x0);nsum+=cr;tsum+=TriRest0[t].w*TriangleFu(x0,x1,x2,TriRest1[t],TriRest2[t]);}
+    float3 n=SafeNormalize(nsum,SafeNormalize(VertexRestNormal[i].xyz,float3(0,0,1)));float3 tt=tsum-dot(tsum,n)*n;float3 fallback=AnyPerpendicular(n);float3 tangent=SafeNormalize(tt,fallback);VertexNormal[i]=float4(n,0);VertexTangent[i]=float4(tangent,0);
+}
+
+// Run once per rendered frame after GatherVertexFrames. It copies previous *rendered frame* positions,
+// never solver substep positions, so motion-vector consumers receive the expected history.
+[numthreads(128,1,1)] void BuildRenderVertices(uint3 tid:SV_DispatchThreadID)
+{
+    uint r=tid.x;if(r>=RRenderVertexCount())return;uint4 b=RenderBinding[r];float4 q=RenderBaryOffset[r];float3 x0=State0[b.x].xyz,x1=State0[b.y].xyz,x2=State0[b.z].xyz;float3 p=q.x*x0+q.y*x1+q.z*x2;float3 faceN=SafeNormalize(cross(x1-x0,x2-x0),SafeNormalize(q.x*VertexRestNormal[b.x].xyz+q.y*VertexRestNormal[b.y].xyz+q.z*VertexRestNormal[b.z].xyz,float3(0,0,1)));float3 n=SafeNormalize(q.x*VertexNormal[b.x].xyz+q.y*VertexNormal[b.y].xyz+q.z*VertexNormal[b.z].xyz,faceN);float3 t=SafeNormalize((q.x*VertexTangent[b.x].xyz+q.y*VertexTangent[b.y].xyz+q.z*VertexTangent[b.z].xyz)-n*dot(q.x*VertexTangent[b.x].xyz+q.y*VertexTangent[b.y].xyz+q.z*VertexTangent[b.z].xyz,n),AnyPerpendicular(n));RenderPreviousPosition[r]=RenderPosition[r];RenderPosition[r]=float4(p+q.w*faceN,asfloat(b.w));RenderNormal[r]=float4(n,0);RenderTangent[r]=float4(t,(b.w&1u)!=0u?-1.0f:1.0f);
+}

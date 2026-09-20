@@ -1,0 +1,458 @@
+/*=============================================================================
+  TARibbonVertexFactory.ush
+
+  Static-mesh UV/color streams are retained for material evaluation, while
+  position, previous position, normal, and tangent are fetched from the
+  persistent simulation render buffers. Simulation positions are world-space
+  meters; this VF converts them to component-local Unreal centimeters before
+  the ordinary primitive LocalToWorld transform is applied.
+=============================================================================*/
+
+#include "/Engine/Private/VertexFactoryCommon.ush"
+
+StructuredBuffer<float4> TARibbonCurrentPosition;
+StructuredBuffer<float4> TARibbonPreviousPosition;
+StructuredBuffer<float4> TARibbonCurrentNormal;
+StructuredBuffer<float4> TARibbonCurrentTangent;
+// These SRVs are shared by Base/Depth/Velocity/VSM draws; draw passes never advance simulation state.
+float4x4 TARibbonWorldToComponentLocal;
+float4x4 TARibbonWorldToComponentRotation;
+uint TARibbonVertexIndexOffset;
+uint TARibbonDeformable;
+uint TARibbonVelocityEnabled;
+
+struct FVertexFactoryInput
+{
+	float4 Position : ATTRIBUTE0;
+	HALF3_TYPE TangentX : ATTRIBUTE1;
+	HALF4_TYPE TangentZ : ATTRIBUTE2;
+	HALF4_TYPE Color : ATTRIBUTE3;
+
+#if NUM_MATERIAL_TEXCOORDS_VERTEX
+	#if NUM_MATERIAL_TEXCOORDS_VERTEX > 1
+		float4 TexCoords0 : ATTRIBUTE4;
+	#elif NUM_MATERIAL_TEXCOORDS_VERTEX == 1
+		float2 TexCoords0 : ATTRIBUTE4;
+	#endif
+	#if NUM_MATERIAL_TEXCOORDS_VERTEX > 3
+		float4 TexCoords1 : ATTRIBUTE5;
+	#elif NUM_MATERIAL_TEXCOORDS_VERTEX == 3
+		float2 TexCoords1 : ATTRIBUTE5;
+	#endif
+	#if NUM_MATERIAL_TEXCOORDS_VERTEX > 5
+		float4 TexCoords2 : ATTRIBUTE6;
+	#elif NUM_MATERIAL_TEXCOORDS_VERTEX == 5
+		float2 TexCoords2 : ATTRIBUTE6;
+	#endif
+	#if NUM_MATERIAL_TEXCOORDS_VERTEX > 7
+		float4 TexCoords3 : ATTRIBUTE7;
+	#elif NUM_MATERIAL_TEXCOORDS_VERTEX == 7
+		float2 TexCoords3 : ATTRIBUTE7;
+	#endif
+#endif
+
+	VF_GPUSCENE_DECLARE_INPUT_BLOCK(13)
+	VF_INSTANCED_STEREO_DECLARE_INPUT_BLOCK()
+	VF_MOBILE_MULTI_VIEW_DECLARE_INPUT_BLOCK()
+	uint VertexId : SV_VertexID;
+};
+
+struct FPositionOnlyVertexFactoryInput
+{
+	float4 Position : ATTRIBUTE0;
+	VF_GPUSCENE_DECLARE_INPUT_BLOCK(1)
+	VF_INSTANCED_STEREO_DECLARE_INPUT_BLOCK()
+	VF_MOBILE_MULTI_VIEW_DECLARE_INPUT_BLOCK()
+	uint VertexId : SV_VertexID;
+};
+
+struct FPositionAndNormalOnlyVertexFactoryInput
+{
+	float4 Position : ATTRIBUTE0;
+	float4 Normal : ATTRIBUTE1;
+	VF_GPUSCENE_DECLARE_INPUT_BLOCK(2)
+	VF_INSTANCED_STEREO_DECLARE_INPUT_BLOCK()
+	VF_MOBILE_MULTI_VIEW_DECLARE_INPUT_BLOCK()
+	uint VertexId : SV_VertexID;
+};
+
+struct FVertexFactoryInterpolantsVSToPS
+{
+#if INTERPOLATE_VERTEX_COLOR
+	float4 Color : COLOR0;
+#endif
+
+#if NUM_TEX_COORD_INTERPOLATORS
+	float4 TexCoords[(NUM_TEX_COORD_INTERPOLATORS + 1) / 2] : TEXCOORD0;
+#endif
+
+#if VF_USE_PRIMITIVE_SCENE_DATA
+	nointerpolation uint PrimitiveId : PRIMITIVE_ID;
+#endif
+
+	TANGENTTOWORLD_INTERPOLATOR_BLOCK
+};
+
+#if NUM_TEX_COORD_INTERPOLATORS
+float2 GetUV(FVertexFactoryInterpolantsVSToPS Interpolants, int UVIndex)
+{
+	const float4 UVVector = Interpolants.TexCoords[UVIndex / 2];
+	return (UVIndex & 1) != 0 ? UVVector.zw : UVVector.xy;
+}
+
+void SetUV(inout FVertexFactoryInterpolantsVSToPS Interpolants, int UVIndex, float2 InValue)
+{
+	FLATTEN
+	if ((UVIndex & 1) != 0)
+	{
+		Interpolants.TexCoords[UVIndex / 2].zw = InValue;
+	}
+	else
+	{
+		Interpolants.TexCoords[UVIndex / 2].xy = InValue;
+	}
+}
+#endif
+
+struct FVertexFactoryRayTracingInterpolants
+{
+	FVertexFactoryInterpolantsVSToPS InterpolantsVSToPS;
+};
+
+FMaterialPixelParameters GetMaterialPixelParameters(FVertexFactoryInterpolantsVSToPS Interpolants, float4 SvPosition)
+{
+	FMaterialPixelParameters Result = MakeInitializedMaterialPixelParameters();
+
+#if NUM_TEX_COORD_INTERPOLATORS
+	UNROLL
+	for (int CoordinateIndex = 0; CoordinateIndex < NUM_TEX_COORD_INTERPOLATORS; ++CoordinateIndex)
+	{
+		Result.TexCoords[CoordinateIndex] = GetUV(Interpolants, CoordinateIndex);
+	}
+#endif
+
+	const half3 TangentToWorld0 = Interpolants.TangentToWorld0.xyz;
+	const half4 TangentToWorld2 = Interpolants.TangentToWorld2;
+	Result.TangentToWorld = AssembleTangentToWorld(TangentToWorld0, TangentToWorld2);
+#if USE_WORLDVERTEXNORMAL_CENTER_INTERPOLATION
+	Result.WorldVertexNormal_Center = Interpolants.TangentToWorld2_Center.xyz;
+#endif
+	Result.UnMirrored = TangentToWorld2.w;
+	Result.TwoSidedSign = 1;
+#if INTERPOLATE_VERTEX_COLOR
+	Result.VertexColor = 1;
+#else
+	Result.VertexColor = 1;
+#endif
+#if VF_USE_PRIMITIVE_SCENE_DATA
+	Result.PrimitiveId = Interpolants.PrimitiveId;
+#endif
+	return Result;
+}
+
+struct FVertexFactoryIntermediates
+{
+	float3 CurrentLocalPosition;
+	float3 PreviousLocalPosition;
+	float3x3 TangentToLocal;
+	float3x3 TangentToWorld;
+	float TangentToWorldSign;
+	float4 Color;
+	FSceneDataIntermediates SceneData;
+};
+
+FPrimitiveSceneData GetPrimitiveData(FVertexFactoryIntermediates Intermediates)
+{
+	return Intermediates.SceneData.Primitive;
+}
+
+float3 TARibbonWorldToLocalPosition(float3 WorldMeters)
+{
+	return mul(float4(WorldMeters * 100.0f, 1.0f), TARibbonWorldToComponentLocal).xyz;
+}
+
+float3 TARibbonWorldToLocalDirection(float3 WorldDirection)
+{
+	return normalize(mul(WorldDirection, (float3x3)TARibbonWorldToComponentRotation));
+}
+
+uint TARibbonGetVertexIndex(uint VertexId)
+{
+	return VertexId - TARibbonVertexIndexOffset;
+}
+
+float3 TARibbonGetCurrentLocalPosition(uint VertexId, float3 FallbackPosition)
+{
+	if (TARibbonDeformable != 0)
+	{
+		return TARibbonWorldToLocalPosition(TARibbonCurrentPosition[TARibbonGetVertexIndex(VertexId)].xyz);
+	}
+	return FallbackPosition;
+}
+
+float3 TARibbonGetPreviousLocalPosition(uint VertexId, float3 CurrentLocalPosition)
+{
+	if (TARibbonVelocityEnabled != 0 && TARibbonDeformable != 0)
+	{
+		return TARibbonWorldToLocalPosition(TARibbonPreviousPosition[TARibbonGetVertexIndex(VertexId)].xyz);
+	}
+	return CurrentLocalPosition;
+}
+
+float3 TARibbonGetLocalNormal(uint VertexId, float3 FallbackNormal)
+{
+	if (TARibbonDeformable != 0)
+	{
+		return TARibbonWorldToLocalDirection(TARibbonCurrentNormal[TARibbonGetVertexIndex(VertexId)].xyz);
+	}
+	return normalize(FallbackNormal);
+}
+
+float3 TARibbonGetLocalTangent(uint VertexId, float3 FallbackTangent)
+{
+	if (TARibbonDeformable != 0)
+	{
+		return TARibbonWorldToLocalDirection(TARibbonCurrentTangent[TARibbonGetVertexIndex(VertexId)].xyz);
+	}
+	return normalize(FallbackTangent);
+}
+
+void CalcTangentToWorld(FVertexFactoryIntermediates Intermediates, out float3 TangentToWorld0, out float4 TangentToWorld2)
+{
+	float3x3 LocalToWorld = DFToFloat3x3(Intermediates.SceneData.InstanceData.LocalToWorld);
+	const float3 InvScale = GetPrimitiveData(Intermediates).InvNonUniformScale;
+	LocalToWorld[0] *= InvScale.x;
+	LocalToWorld[1] *= InvScale.y;
+	LocalToWorld[2] *= InvScale.z;
+
+	const float3x3 TangentToWorld = mul(Intermediates.TangentToLocal, LocalToWorld);
+	TangentToWorld0 = TangentToWorld[0];
+	TangentToWorld2 = float4(TangentToWorld[2], Intermediates.TangentToWorldSign);
+}
+
+FVertexFactoryIntermediates GetVertexFactoryIntermediates(FVertexFactoryInput Input)
+{
+	FVertexFactoryIntermediates Intermediates = (FVertexFactoryIntermediates)0;
+	Intermediates.SceneData = VF_GPUSCENE_GET_INTERMEDIATES(Input);
+	Intermediates.CurrentLocalPosition = TARibbonGetCurrentLocalPosition(Input.VertexId, Input.Position.xyz);
+	Intermediates.PreviousLocalPosition = TARibbonGetPreviousLocalPosition(Input.VertexId, Intermediates.CurrentLocalPosition);
+
+	const float3 FallbackNormal = normalize(TangentBias(Input.TangentZ).xyz);
+	const float3 FallbackTangent = normalize(TangentBias(Input.TangentX));
+	const float3 LocalNormal = TARibbonGetLocalNormal(Input.VertexId, FallbackNormal);
+	const float3 LocalTangent = TARibbonGetLocalTangent(Input.VertexId, FallbackTangent);
+	const float TangentSign = TARibbonDeformable != 0
+		? (TARibbonCurrentTangent[TARibbonGetVertexIndex(Input.VertexId)].w < 0.0f ? -1.0f : 1.0f)
+		: (TangentBias(Input.TangentZ).w < 0.0f ? -1.0f : 1.0f);
+	const float3 LocalBitangent = normalize(cross(LocalNormal, LocalTangent) * TangentSign);
+
+	Intermediates.TangentToLocal[0] = normalize(cross(LocalBitangent, LocalNormal) * TangentSign);
+	Intermediates.TangentToLocal[1] = LocalBitangent;
+	Intermediates.TangentToLocal[2] = LocalNormal;
+	Intermediates.TangentToWorldSign = TangentSign *
+		GetPrimitive_DeterminantSign_FromFlags(GetPrimitiveData(Intermediates).Flags);
+	float3 TangentToWorld0;
+	float4 TangentToWorld2;
+	CalcTangentToWorld(Intermediates, TangentToWorld0, TangentToWorld2);
+	Intermediates.TangentToWorld[0] = TangentToWorld0;
+	Intermediates.TangentToWorld[1] = normalize(cross(TangentToWorld2.xyz, TangentToWorld0) * TangentToWorld2.w);
+	Intermediates.TangentToWorld[2] = TangentToWorld2.xyz;
+	Intermediates.TangentToWorldSign = TangentToWorld2.w;
+	Intermediates.Color = 1;
+	return Intermediates;
+}
+
+float3 VertexFactoryGetWorldNormal(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates)
+{
+	return Intermediates.TangentToWorld[2];
+}
+
+float3x3 VertexFactoryGetTangentToLocal(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates)
+{
+	return Intermediates.TangentToLocal;
+}
+
+float4 VertexFactoryGetWorldPosition(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates)
+{
+	return TransformLocalToTranslatedWorld(Intermediates.CurrentLocalPosition, Intermediates.SceneData.InstanceData.LocalToWorld);
+}
+
+float3 VertexFactoryGetInstanceSpacePosition(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates)
+{
+	return Intermediates.CurrentLocalPosition;
+}
+
+float4 VertexFactoryGetRasterizedWorldPosition(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates, float4 InWorldPosition)
+{
+	return InWorldPosition;
+}
+
+float3 VertexFactoryGetPositionForVertexLighting(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates, float3 TranslatedWorldPosition)
+{
+	return TranslatedWorldPosition;
+}
+
+FMaterialVertexParameters GetMaterialVertexParameters(
+	FVertexFactoryInput Input,
+	FVertexFactoryIntermediates Intermediates,
+	float3 WorldPosition,
+	float3x3 TangentToLocal,
+	bool bIsPreviousFrame = false)
+{
+	FMaterialVertexParameters Result = MakeInitializedMaterialVertexParameters();
+	Result.SceneData = Intermediates.SceneData;
+	Result.WorldPosition = WorldPosition;
+	Result.PositionInstanceSpace = bIsPreviousFrame ? Intermediates.PreviousLocalPosition : Intermediates.CurrentLocalPosition;
+	Result.PositionPrimitiveSpace = bIsPreviousFrame
+		? mul(float4(WorldPosition, 1.0f), DFFastToTranslatedWorld(Intermediates.SceneData.Primitive.PreviousWorldToLocal, ResolvedView.PrevPreViewTranslation)).xyz
+		: mul(float4(WorldPosition, 1.0f), DFFastToTranslatedWorld(Intermediates.SceneData.Primitive.WorldToLocal, ResolvedView.PreViewTranslation)).xyz;
+	Result.VertexColor = 1;
+	Result.TangentToWorld = Intermediates.TangentToWorld;
+	Result.PreSkinnedPosition = Intermediates.CurrentLocalPosition;
+	Result.PreSkinnedNormal = Intermediates.TangentToLocal[2];
+
+#if NUM_MATERIAL_TEXCOORDS_VERTEX
+	Result.TexCoords[0] = Input.TexCoords0.xy;
+	#if NUM_MATERIAL_TEXCOORDS_VERTEX > 1
+		Result.TexCoords[1] = Input.TexCoords0.xy;
+	#endif
+	#if NUM_MATERIAL_TEXCOORDS_VERTEX > 2
+		Result.TexCoords[2] = Input.TexCoords1.xy;
+	#endif
+	#if NUM_MATERIAL_TEXCOORDS_VERTEX > 3
+		Result.TexCoords[3] = Input.TexCoords1.xy;
+	#endif
+#endif
+
+#if VF_USE_PRIMITIVE_SCENE_DATA
+	Result.PrimitiveId = Intermediates.SceneData.PrimitiveId;
+#endif
+	Result.LWCData = MakeMaterialLWCData(Result);
+	return Result;
+}
+
+FVertexFactoryInterpolantsVSToPS VertexFactoryGetInterpolantsVSToPS(
+	FVertexFactoryInput Input,
+	FVertexFactoryIntermediates Intermediates,
+	FMaterialVertexParameters VertexParameters)
+{
+	FVertexFactoryInterpolantsVSToPS Interpolants = (FVertexFactoryInterpolantsVSToPS)0;
+
+#if NUM_TEX_COORD_INTERPOLATORS
+	float2 CustomizedUVs[NUM_TEX_COORD_INTERPOLATORS];
+	GetMaterialCustomizedUVs(VertexParameters, CustomizedUVs);
+	GetCustomInterpolators(VertexParameters, CustomizedUVs);
+	UNROLL
+	for (int CoordinateIndex = 0; CoordinateIndex < NUM_TEX_COORD_INTERPOLATORS; ++CoordinateIndex)
+	{
+		SetUV(Interpolants, CoordinateIndex, CustomizedUVs[CoordinateIndex]);
+	}
+#endif
+
+	CalcTangentToWorld(Intermediates, Interpolants.TangentToWorld0.xyz, Interpolants.TangentToWorld2);
+#if INTERPOLATE_VERTEX_COLOR
+	Interpolants.Color = Intermediates.Color;
+#endif
+#if VF_USE_PRIMITIVE_SCENE_DATA
+	Interpolants.PrimitiveId = Intermediates.SceneData.PrimitiveId;
+#endif
+	return Interpolants;
+}
+
+float4 VertexFactoryGetPreviousWorldPosition(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates)
+{
+	return TransformPreviousLocalPositionToTranslatedWorld(Intermediates.PreviousLocalPosition, Intermediates.SceneData.Primitive.PreviousLocalToWorld);
+}
+
+float3 VertexFactoryGetPreviousInstanceSpacePosition(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates)
+{
+	return Intermediates.PreviousLocalPosition;
+}
+
+float4 VertexFactoryGetWorldPosition(FPositionOnlyVertexFactoryInput Input)
+{
+	const FSceneDataIntermediates SceneData = VF_GPUSCENE_GET_INTERMEDIATES(Input);
+	const float3 Position = TARibbonGetCurrentLocalPosition(Input.VertexId, Input.Position.xyz);
+	return TransformLocalToTranslatedWorld(Position, SceneData.InstanceData.LocalToWorld);
+}
+
+float4 VertexFactoryGetWorldPosition(FPositionAndNormalOnlyVertexFactoryInput Input)
+{
+	const FSceneDataIntermediates SceneData = VF_GPUSCENE_GET_INTERMEDIATES(Input);
+	const float3 Position = TARibbonGetCurrentLocalPosition(Input.VertexId, Input.Position.xyz);
+	return TransformLocalToTranslatedWorld(Position, SceneData.InstanceData.LocalToWorld);
+}
+
+float3 VertexFactoryGetWorldNormal(FPositionAndNormalOnlyVertexFactoryInput Input)
+{
+	const FSceneDataIntermediates SceneData = VF_GPUSCENE_GET_INTERMEDIATES(Input);
+	if (TARibbonDeformable != 0)
+	{
+		const float3 LocalNormal = TARibbonWorldToLocalDirection(
+			TARibbonCurrentNormal[TARibbonGetVertexIndex(Input.VertexId)].xyz);
+		return RotateLocalToWorld(LocalNormal, SceneData.InstanceData.LocalToWorld,
+			SceneData.InstanceData.InvNonUniformScale);
+	}
+	return RotateLocalToWorld(normalize(TangentBias(Input.Normal).xyz),
+		SceneData.InstanceData.LocalToWorld, SceneData.InstanceData.InvNonUniformScale);
+}
+
+float4 VertexFactoryGetTranslatedPrimitiveVolumeBounds(FVertexFactoryInterpolantsVSToPS Interpolants)
+{
+	return 0;
+}
+
+uint VertexFactoryGetPrimitiveId(FVertexFactoryInterpolantsVSToPS Interpolants)
+{
+#if VF_USE_PRIMITIVE_SCENE_DATA
+	return Interpolants.PrimitiveId;
+#else
+	return 0;
+#endif
+}
+
+#if NEEDS_VERTEX_FACTORY_INTERPOLATION
+float2 VertexFactoryGetRayTracingTextureCoordinate(FVertexFactoryRayTracingInterpolants Interpolants)
+{
+#if NUM_MATERIAL_TEXCOORDS
+	return Interpolants.InterpolantsVSToPS.TexCoords[0].xy;
+#else
+	return float2(0, 0);
+#endif
+}
+
+FVertexFactoryInterpolantsVSToPS VertexFactoryAssignInterpolants(FVertexFactoryRayTracingInterpolants Input)
+{
+	return Input.InterpolantsVSToPS;
+}
+
+FVertexFactoryRayTracingInterpolants VertexFactoryGetRayTracingInterpolants(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates, FMaterialVertexParameters VertexParameters)
+{
+	FVertexFactoryRayTracingInterpolants Interpolants;
+	Interpolants.InterpolantsVSToPS = VertexFactoryGetInterpolantsVSToPS(Input, Intermediates, VertexParameters);
+	return Interpolants;
+}
+
+FVertexFactoryRayTracingInterpolants VertexFactoryInterpolate(FVertexFactoryRayTracingInterpolants A, float AInterp, FVertexFactoryRayTracingInterpolants B, float BInterp)
+{
+	FVertexFactoryRayTracingInterpolants O;
+	INTERPOLATE_MEMBER(InterpolantsVSToPS.TangentToWorld0.xyz);
+	INTERPOLATE_MEMBER(InterpolantsVSToPS.TangentToWorld2);
+#if INTERPOLATE_VERTEX_COLOR
+	INTERPOLATE_MEMBER(InterpolantsVSToPS.Color);
+#endif
+#if NUM_TEX_COORD_INTERPOLATORS
+	UNROLL
+	for (int TexCoord = 0; TexCoord < (NUM_TEX_COORD_INTERPOLATORS + 1) / 2; ++TexCoord)
+	{
+		INTERPOLATE_MEMBER(InterpolantsVSToPS.TexCoords[TexCoord]);
+	}
+#endif
+#if VF_USE_PRIMITIVE_SCENE_DATA
+	O.InterpolantsVSToPS.PrimitiveId = A.InterpolantsVSToPS.PrimitiveId;
+#endif
+	return O;
+}
+#endif
+
+#include "/Engine/Private/VertexFactoryDefaultInterface.ush"

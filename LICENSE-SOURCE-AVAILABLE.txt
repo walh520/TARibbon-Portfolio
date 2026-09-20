@@ -1,0 +1,16 @@
+TARibbon Source-Available License
+
+Copyright (c) 2026 NiTong. All rights reserved.
+
+Permission is granted to read and evaluate the source code and documentation in
+this repository for non-commercial purposes.
+
+Without prior written permission, no permission is granted to:
+
+- use this implementation in a production project;
+- copy, redistribute, or sublicense the implementation;
+- publish a derivative implementation based on this source;
+- use the implementation commercially.
+
+This is a source-available license, not an open-source license. Third-party
+files and trademarks remain subject to their original terms.

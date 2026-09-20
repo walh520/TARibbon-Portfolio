@@ -1,0 +1,82 @@
+#include "/Engine/Public/Platform.ush"
+#include "/Plugin/SceneWind/Private/SceneWindFieldCommon.ush"
+
+uint TriangleCount;
+float SampleTimeSeconds;
+float2 BoundsCenter;
+float2 BoundsExtent;
+uint WindMode;
+float2 BaseDirection;
+float BaseSpeed;
+float NoiseStrength;
+float NoiseScale;
+float GustStrength;
+float GustFrequency;
+float RandomScale;
+float RandomStrength;
+float RandomDirectionalBias;
+float WaveLengthCm;
+float WaveSpeedCmS;
+float WaveAmplitude;
+float CrossWaveLengthCm;
+float WaveSideStrength;
+float UniformMicroTurbulenceStrength;
+float UniformMicroTurbulenceScale;
+
+StructuredBuffer<float4> State0;
+StructuredBuffer<uint4> TriIndices;
+RWStructuredBuffer<float4> FaceWind;
+
+[numthreads(128, 1, 1)]
+void SampleSceneWind(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint TriangleIndex = DispatchThreadId.x;
+	if (TriangleIndex >= TriangleCount)
+	{
+		return;
+	}
+
+	const uint4 Triangle = TriIndices[TriangleIndex];
+	if ((Triangle.w & 1u) == 0u)
+	{
+		FaceWind[TriangleIndex] = 0.0f;
+		return;
+	}
+
+	SceneWind_FieldEvaluationParameters Parameters;
+	Parameters.BoundsCenter = BoundsCenter;
+	Parameters.BoundsExtent = BoundsExtent;
+	Parameters.WindMode = WindMode;
+	Parameters.BaseDirection = BaseDirection;
+	Parameters.BaseSpeed = BaseSpeed;
+	Parameters.MaxVisualSpeed = 1.0f;
+	Parameters.NoiseStrength = NoiseStrength;
+	Parameters.NoiseScale = NoiseScale;
+	Parameters.GustStrength = GustStrength;
+	Parameters.GustFrequency = GustFrequency;
+	Parameters.RandomScale = RandomScale;
+	Parameters.RandomStrength = RandomStrength;
+	Parameters.RandomDirectionalBias = RandomDirectionalBias;
+	Parameters.WaveLengthCm = WaveLengthCm;
+	Parameters.WaveSpeedCmS = WaveSpeedCmS;
+	Parameters.WaveAmplitude = WaveAmplitude;
+	Parameters.CrossWaveLengthCm = CrossWaveLengthCm;
+	Parameters.WaveSideStrength = WaveSideStrength;
+	Parameters.UniformMicroTurbulenceStrength = UniformMicroTurbulenceStrength;
+	Parameters.UniformMicroTurbulenceScale = UniformMicroTurbulenceScale;
+
+	const float3 CentroidMeters =
+		(State0[Triangle.x].xyz + State0[Triangle.y].xyz + State0[Triangle.z].xyz) / 3.0f;
+	const float2 WorldCentroidCm = CentroidMeters.xy * 100.0f;
+	if (!SceneWind_IsInsideBounds(WorldCentroidCm, Parameters))
+	{
+		FaceWind[TriangleIndex] = 0.0f;
+		return;
+	}
+
+	const float2 VelocityCmS = SceneWind_EvaluateVelocityCmS(
+		WorldCentroidCm,
+		SampleTimeSeconds,
+		Parameters);
+	FaceWind[TriangleIndex] = float4(VelocityCmS * 0.01f, 0.0f, 0.0f);
+}
