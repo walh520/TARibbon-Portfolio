@@ -2,80 +2,77 @@
 
 UE GPU 单片布料系统
 
-> GPU XPBD 单片布料源码快照；本地增加基础透明材质路径，透明排序、阴影及专用 Velocity 不作保证。
+使用 GPU XPBD 模拟旗帜、挂布、薄片与单层连通网格，结合 Bake 数据、风场、简单形状碰撞和编辑器预览，形成从网格准备到实时形变的创作流程。
 
-[GitHub 仓库](https://github.com/walh520/TARibbon-Portfolio)
+[GitHub 仓库](https://github.com/walh520/TARibbon-Portfolio) · [布料演示](https://www.bilibili.com/video/BV1n5eA6FEAH/) · [作品总集](https://www.bilibili.com/video/BV1MVak6jEPv/)
 
-## 简介与公开范围
+## 项目内容
 
-面向 UE 5.7 系列、项目 API 对应 5.7.4 的 GPU 单片布料系统，适用于旗帜、挂布、薄片和单层连通网格。本仓库是 Runtime / Editor 模块、Shader 与说明文档的源码快照，不是完整 Unreal 工程。
+项目面向 UE 5.7 系列，使用 5.7.4 项目 API。本仓库提供 Runtime / Editor 模块、Shader 与说明文档；集成所需的 UE 工程、配置和资产需另行准备。
 
-## 本地工程与公开快照
-
-公开插件树的 42 个文件中，38 个与本地相同、4 个内容不同；GPU 求解与 Shader 本体保持一致。差异集中于材质校验、SceneProxy、说明文档和描述文件。
-
-公开版要求 Opaque/Masked 与 Two Sided；本地材质校验已接受基本半透明混合，并继续要求 Two Sided。当前本地透明分支沿用 UE 基础透明路线，没有三角形排序/OIT、透明阴影或专用透明 Velocity 保证。因此不能把公开 Opaque/Masked 路径的 Base/Depth/Velocity/VSM 覆盖无条件写到透明布料上。
-
-## 演示
-
-[布料演示](https://www.bilibili.com/video/BV1n5eA6FEAH/) · [作品总集](https://www.bilibili.com/video/BV1MVak6jEPv/)
-
-视频可能来自依赖与资产齐全的作品工程，展示范围可以大于当前公开快照；不能用视频替代本快照的构建和验证记录。
+演示视频来自完整作品工程，展示内容包含当前公开快照之外的依赖与资产。
 
 ## 实现与贡献
 
-依据 [ATTRIBUTION.md](ATTRIBUTION.md)，NiTong 完成 UE 插件架构、C++/HLSL 实现、GPU 资源调度、Bake v2 契约、编辑器预览、碰撞适配、诊断与验证工作流。XPBD、布料约束、空气动力学及数值方法来自已有研究与公开方法，不作为个人发明。
+NiTong 负责 UE 插件架构、C++/HLSL 实现、GPU 资源调度、Bake v2 契约、编辑器预览、碰撞适配、诊断与验证工作流。求解与受力模型参考既有 XPBD、布料约束、空气动力学及数值方法，详细来源见 [ATTRIBUTION.md](ATTRIBUTION.md)。
 
 ## 核心功能
 
-- GPU 持久状态下的 XPBD；固定步长、子步及约束迭代控制。
-- 支持非平面、单片边连通且可定向 Rest Mesh 的 Bake v2 数据契约。
-- 顶点色 R/G/B 分别表达硬固定、风响应、透风率。
-- SceneWind / ArtWind 风输入；球体、胶囊、单面无限平面接触。
-- 编辑器视口预览、暂停、重置、单步的实现路径。
-- 公开 Opaque/Masked 路径将形变接入 Base/Depth/Velocity/VSM，并维护 Bounds 与速度历史；本地透明扩展不共享完整的通过性保证。
+- **GPU XPBD**：使用持久 GPU 状态，支持固定步长、子步与约束迭代控制。
+- **Bake v2**：为非平面、单片边连通且可定向的 Rest Mesh 建立求解数据。
+- **顶点色控制**：R/G/B 分别表达硬固定、风响应和透风率。
+- **风与接触**：接入 SceneWind / ArtWind，提供球体、胶囊、单面无限平面碰撞。
+- **编辑器预览**：实现视口预览、暂停、重置与单步操作路径。
+- **形变渲染**：公开版 Opaque/Masked 路径接入 Base/Depth/Velocity/VSM，并维护 Bounds 与速度历史。
 
-## 方案与取舍
+## 求解与架构
 
-| 选择 | 目的与边界 |
+| 设计 | 实现方式 |
 | --- | --- |
-| GPU 持久状态与 RDG compute passes | 避免把每帧完整状态交回 CPU；需要管理跨帧资源与逐子步输入。 |
-| 单片连通网格与 Bake v2 契约 | 收窄输入、明确固定与风响应语义，不承诺通用服装系统。 |
-| 独立简单形状碰撞组件 | 支持可控的接触输入；不等同于任意场景碰撞或 Chaos 接触体系。 |
-| 预览生命周期与正式求解路径共用 | 便于重置与单步检查；保存、PIE、重建等生命周期仍需实测。 |
+| GPU 持久状态与 RDG compute passes | 跨帧保留求解数据，按子步更新输入，减少完整状态的 CPU 往返。 |
+| 单片连通网格与 Bake v2 | 明确网格拓扑、固定区域与风响应语义，聚焦单片布料。 |
+| 独立形状碰撞组件 | 以球体、胶囊和平面提供可控的接触输入。 |
+| 共用求解路径的编辑器预览 | 通过同一求解流程支持重置、暂停与单步检查。 |
 
-本地透明支持放宽了材质输入，仍把求解与材质混合模式分开：透明度不改变物理透风率（顶点色 B）。`GetViewRelevance` 的 Velocity 条件仍要求 Opaque；透明褶皱前后排序、TSR/运动模糊及 VSM 透射/不透明度阴影不能推定正确。
+Shader 使用 XPBD 标量投影 `Δλ=(-C-α̃λ)/(Σw|∇C|²+α̃)`，柔度按子步时间平方缩放。求解依次更新三角 U/V 长度应变与剪切，再处理二面角弯曲；颜色批次用于隔离共享顶点的写入冲突。
 
-实际 Shader 采用 XPBD 标量投影 `Δλ=(-C-α̃λ)/(Σw|∇C|²+α̃)`，柔度按子步时间平方缩放；依次更新三角 U/V 长度应变与剪切，再处理二面角弯曲。颜色批次隔离共享顶点冲突。这是求解结构说明，不保证任意参数下的稳定性或实测性能。
+## 本地材质扩展
+
+公开版材质要求为 Opaque/Masked 与 Two Sided。本地版本在保持 GPU 求解和 Shader 本体一致的基础上，扩展材质校验与 SceneProxy，接受基础半透明混合模式，并继续要求 Two Sided。
+
+本地透明分支沿用 UE 基础透明路线，未加入三角形排序或 OIT。`GetViewRelevance` 的 Velocity 条件仍限定 Opaque；透明褶皱排序、TSR/运动模糊及 VSM 透射/不透明度阴影尚待验证。
+
+材质透明度与物理透风率分开控制，透风率仍由顶点色 B 决定。该材质扩展尚未包含在当前公开快照中。
 
 ## 代码阅读入口
 
-1. [TARibbonComponent.h](Plugins/TARibbon/Source/TARibbon/Public/TARibbonComponent.h) 与 [WorldSubsystem](Plugins/TARibbon/Source/TARibbon/Public/TARibbonWorldSubsystem.h)：组件与调度入口。
-2. [TARibbonGpuSimulation.cpp](Plugins/TARibbon/Source/TARibbon/Private/Rendering/TARibbonGpuSimulation.cpp) → [RibbonKernels.usf](Plugins/TARibbon/Shaders/Private/RibbonKernels.usf)：资源、子步与求解。
-3. [TARibbonMeshData.cpp](Plugins/TARibbon/Source/TARibbon/Private/TARibbonMeshData.cpp)：Bake 数据。
-4. [ColliderComponent](Plugins/TARibbon/Source/TARibbon/Public/TARibbonColliderComponent.h) 与 [EditorModule](Plugins/TARibbon/Source/TARibbonEditor/Private/TARibbonEditorModule.cpp)：碰撞及预览生命周期。
-5. [设置与创作说明](Plugins/TARibbon/Docs/TARibbon_V1_Setup_CN.md)、[V1.3 验证清单](Plugins/TARibbon/Docs/TARibbon_V13_Verification_CN.md)。
+1. [TARibbonComponent.h](Plugins/TARibbon/Source/TARibbon/Public/TARibbonComponent.h) 与 [WorldSubsystem](Plugins/TARibbon/Source/TARibbon/Public/TARibbonWorldSubsystem.h)：组件与调度入口
+2. [TARibbonGpuSimulation.cpp](Plugins/TARibbon/Source/TARibbon/Private/Rendering/TARibbonGpuSimulation.cpp) → [RibbonKernels.usf](Plugins/TARibbon/Shaders/Private/RibbonKernels.usf)：资源、子步与求解
+3. [TARibbonMeshData.cpp](Plugins/TARibbon/Source/TARibbon/Private/TARibbonMeshData.cpp)：Bake 数据
+4. [ColliderComponent](Plugins/TARibbon/Source/TARibbon/Public/TARibbonColliderComponent.h) 与 [EditorModule](Plugins/TARibbon/Source/TARibbonEditor/Private/TARibbonEditorModule.cpp)：碰撞及预览生命周期
+5. [设置与创作说明](Plugins/TARibbon/Docs/TARibbon_V1_Setup_CN.md)、[V1.3 验证清单](Plugins/TARibbon/Docs/TARibbon_V13_Verification_CN.md)
 
-## 验证与性能
+## 依赖与使用
 
-V1.3 验证文档明确：本轮只做源码实现与静态核对。自动化测试、UBT/UHT、ShaderCompileWorker、Cook、Editor、PIE、GPU Capture、视觉与性能验收均未执行。新增测试文件存在，不代表测试已编译或通过。
+- UE 5.7.4 项目 API
+- 项目插件 SceneWind；正式 Toon 工程配置还间接依赖 TA_WorldInteraction
+- 兼容的 UE 工程、配置、资产与引擎安装，详见 [DEPENDENCIES.md](DEPENDENCIES.md)
 
-本次整理不重新运行 UE，不声称“接触稳定”“预览可用”“动态阴影通过”或“帧率达标”。后续应分别记录网格规模、子步/迭代、碰撞体数、GPU 型号与各通道帧时。
+在依赖齐全的项目中集成 `Plugins/TARibbon` 并构建，按 [Setup](Plugins/TARibbon/Docs/TARibbon_V1_Setup_CN.md) 准备网格：
 
-本轮仅比对当前实现与公开文件；未重跑原静态脚本，也没有 UE 构建、Shader 编译、Editor/PIE、透明视觉或性能验证。局部透明扩展说明明确保留这些验证缺口。
+1. 使用细分网格，LOD0 为单 Section、单材质槽，关闭 Nanite
+2. 设置源网格为 Movable，Scale 为 `(1,1,1)`，材质启用 Two Sided
+3. 用顶点色 R 设置硬固定遮罩，同时保留固定区和自由区
+4. 将 UTARibbonComponent 挂到可见网格所在 Actor，完成 Bake v2 后检查预览与碰撞
 
-## 依赖与运行方式
+碰撞体使用正均匀缩放；V1.3 的碰撞体容量为 64，超过容量时显式报错。
 
-- UE 5.7.4 项目 API；本包不含引擎源码。
-- 项目插件 SceneWind；其正式 Toon 工程配置还间接依赖 TA_WorldInteraction。
-- 还需兼容的 UE 工程、配置、资产与引擎安装，详见 [DEPENDENCIES.md](DEPENDENCIES.md)。
+## 验证状态
 
-在依赖齐全的项目中集成 `Plugins/TARibbon`，再构建并验证。按 [Setup](Plugins/TARibbon/Docs/TARibbon_V1_Setup_CN.md) 使用细分、单 section 网格，设置顶点色 R 硬固定遮罩，将一个 UTARibbonComponent 挂到可见网格所在 Actor；完成 Bake v2 后再检查预览与碰撞。这是目标工程操作路径，当前公开快照没有独立构建通过证据。
+公开快照与本地透明扩展尚未执行自动化测试、UBT/UHT、ShaderCompileWorker、Cook、Editor/PIE、GPU Capture、视觉及性能验收。测试文件和验证清单已随源码提供，编译与运行结果仍待补充。
 
-本地输入校验仍要求源网格 Movable、Scale=(1,1,1)、LOD0 单 Section/单材质槽、Nanite 关闭，并具有固定区与自由区；Two Sided 对透明材质也适用。上述放宽不是任意布料/多材质/任意缩放支持。
+重点验证项包括接触表现、保存/PIE/重建时的预览生命周期、各渲染通道与透明材质表现。当前没有实测性能数据；后续记录需注明网格规模、子步/迭代、碰撞体数、GPU 型号与各通道帧时。
 
-## 限制与来源许可
+## 来源与许可
 
-适用范围是单片布料和明确输入契约。V1.3 记录的碰撞体容量为 64，超过容量显式失败；碰撞体要求正均匀缩放。接触、预览生命周期、VSM 与性能必须按原验证清单逐项实测。
-
-以 [LICENSE-SOURCE-AVAILABLE.txt](LICENSE-SOURCE-AVAILABLE.txt) 发布；保留 [ATTRIBUTION.md](ATTRIBUTION.md) 的算法来源、Epic API 与 SceneWind 依赖说明。称为源码可阅快照，不统一称为开源。
+以 [LICENSE-SOURCE-AVAILABLE.txt](LICENSE-SOURCE-AVAILABLE.txt) 所列的源码可阅（source-available）条款发布。算法来源、Epic API 与 SceneWind 依赖说明见 [ATTRIBUTION.md](ATTRIBUTION.md)。
